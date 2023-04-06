@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use arrow2::array::{Array, Int64Array};
 use arrow2::error::Result;
 use arrow2::io::parquet::read;
@@ -25,12 +27,22 @@ async fn main() -> Result<()> {
             let path = path.clone();
             // to get a sense of what is being queried in s3
             println!("getting {} bytes starting at {}", length, start);
-            let (mut data, _) = bucket
+            let start_time = Instant::now();
+
+            let response = bucket
                 // -1 because ranges are inclusive in `get_object_range`
                 .get_object_range(&path, start, Some(start + length as u64 - 1))
                 .await
                 .map_err(|x| std::io::Error::new(std::io::ErrorKind::Other, x.to_string()))?;
-            println!("got {}/{} bytes starting at {}", data.len(), length, start);
+
+            let mut data: Vec<u8> = response.into();
+            println!(
+                "got {}/{} bytes starting at {} in {} secs",
+                data.len(),
+                length,
+                start,
+                start_time.elapsed().as_secs_f32()
+            );
             data.truncate(length);
             Ok(RangeOutput { start, data })
         }) as BoxFuture<'static, std::io::Result<RangeOutput>>
@@ -49,6 +61,7 @@ async fn main() -> Result<()> {
         )))) as BoxFuture<'static, std::result::Result<RangedAsyncReader, std::io::Error>>
     };
 
+    let start = Instant::now();
     // we need one reader to read the files' metadata
     let mut reader = reader_factory().await?;
 
@@ -56,9 +69,12 @@ async fn main() -> Result<()> {
 
     let schema = read::infer_schema(&metadata)?;
 
-    println!("total number of rows: {}", metadata.num_rows);
-    println!("Infered Arrow schema: {:#?}", schema);
+    println!("total number of rows  : {}", metadata.num_rows);
+    println!("total number of groups: {}", metadata.row_groups.len());
+    println!("Infered Arrow schema  : {:#?}", schema);
+    println!("Done in {} secs", start.elapsed().as_secs_f32());
 
+    let start = Instant::now();
     // let's read the first row group only. Iterate over them to your liking
     let group = &metadata.row_groups[0];
 
@@ -67,7 +83,8 @@ async fn main() -> Result<()> {
 
     // this is IO-bounded (and issues a join, thus the reader_factory)
     let column_chunks =
-        read::read_columns_many_async(reader_factory, group, schema.fields, chunk_size).await?;
+        read::read_columns_many_async(reader_factory, group, schema.fields, chunk_size, None, None)
+            .await?;
 
     // this is CPU-bounded and should be sent to a separate thread-pool.
     // We do it here for simplicity
@@ -84,5 +101,7 @@ async fn main() -> Result<()> {
     // ... and have fun with it.
     println!("len: {}", array.len());
     println!("null_count: {}", array.null_count());
+    println!("Done in {} secs", start.elapsed().as_secs_f32());
+
     Ok(())
 }

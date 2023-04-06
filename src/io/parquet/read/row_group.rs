@@ -173,7 +173,8 @@ pub async fn read_columns_async<
     columns: &'a [ColumnChunkMetaData],
     field_name: &str,
 ) -> Result<Vec<(&'a ColumnChunkMetaData, Vec<u8>)>> {
-    let futures = get_field_columns(columns, field_name)
+    let columns_md = get_field_columns(columns, field_name);
+    let futures = columns_md
         .into_iter()
         .map(|meta| async { _read_single_column_async(reader_factory.clone(), meta).await });
 
@@ -319,11 +320,54 @@ pub async fn read_columns_many_async<
     let num_rows = row_group.num_rows();
     let num_rows = limit.map(|limit| limit.min(num_rows)).unwrap_or(num_rows);
 
-    let futures = fields
+    let all_columns = row_group.columns();
+    let my_columns: Vec<Vec<&ColumnChunkMetaData>> = fields
         .iter()
-        .map(|field| read_columns_async(reader_factory.clone(), row_group.columns(), &field.name));
+        .map(|field| get_field_columns(all_columns, &field.name))
+        .collect();
 
-    let field_columns = try_join_all(futures).await?;
+    let (start, length) = my_columns
+        .iter()
+        .flatten()
+        .map(|meta| meta.byte_range())
+        .reduce(|(a_start, a_length), (e_start, e_length)| {
+            let a_end = a_start + a_length;
+            let e_end = e_start + e_length;
+            let min_start = a_start.min(e_start);
+            (min_start, a_end.max(e_end) - min_start)
+        })
+        .unwrap();
+
+    let mut buffer = vec![];
+    buffer.try_reserve(length as usize)?;
+
+    let mut reader = reader_factory().await?;
+    reader.seek(std::io::SeekFrom::Start(start)).await?;
+
+    reader.take(length).read_to_end(&mut buffer).await?;
+
+    let field_columns: Vec<Vec<(&ColumnChunkMetaData, Vec<u8>)>> = my_columns
+        .iter()
+        .map(|columns| {
+            columns
+                .iter()
+                .map(|md| {
+                    let (column_start, column_length) = md.byte_range();
+                    let relative_start = (column_start - start) as usize;
+                    (
+                        *md,
+                        buffer[relative_start..relative_start + column_length as usize].into(),
+                    )
+                })
+                .collect()
+        })
+        .collect();
+
+    // let futures = fields
+    //     .iter()
+    //     .map(|field| read_columns_async(reader_factory.clone(), all_columns, &field.name));
+
+    // let field_columns = try_join_all(futures).await?;
 
     if let Some(pages) = pages {
         field_columns
